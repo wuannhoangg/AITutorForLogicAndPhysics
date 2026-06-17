@@ -8992,7 +8992,7 @@ def solve_electromagnetic_templates(question: str) -> SolverResult | None:
     if "impedance" in q and R is not None and XL is not None and XC is not None:
         z=math.sqrt(R*R+(XL-XC)**2)
         return _make_result(_electromagnetic_round_for_gold(z, question, 2), "Ω", "Series RLC impedance is sqrt(R²+(XL-XC)²).", "Z=sqrt(R²+(XL-XC)²)", {"Z":z})
-    if XL and XC and ("multiple" in q or "factor" in q) and ("frequency" in q or "angular" in q):
+    if XL and XC and ("multiple" in q or "factor" in q) and ("frequency" in q or "angular" in q) and not ("resistor" in q or "across r" in q or "voltage across" in q):
         k=math.sqrt(XC/XL)
         return _make_result(_electromagnetic_round_for_gold(k, question, 1), None, "At resonance after scaling, kXL=XC/k.", "k=sqrt(XC/XL)", {"k":k})
     km=None

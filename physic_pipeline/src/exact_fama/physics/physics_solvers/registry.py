@@ -249,6 +249,40 @@ def _is_rejectable_mismatch(question: str, spec: SolverSpec, result: SolverResul
             if formula in {"F=ma", "F=m a"}:
                 return True
 
+
+    # Friction prompts require f_k = μ_k m g, not plain F=ma or W=mg.
+    if spec.name == "mechanics_formula_bank" and "friction" in q and re.search(r"coefficient", q):
+        if formula in {"F=ma", "F=m a", "W=mg", "F=mg"}:
+            return True
+
+    # Specific-heat / latent-heat prompts asking for heat Q must not be
+    # answered by inverse relations that solve for ΔT, m, or L.  This is a
+    # generic target-variable guard based only on wording + formula text, not
+    # on dataset ids.
+    if spec.name == "thermodynamics_heat" and (
+        "find q" in q
+        or "heat needed" in q
+        or "calculate the heat" in q
+        or "heat transfer" in q
+        or "energy is needed" in q
+    ):
+        compact = formula.replace(" ", "")
+        if (
+            compact in {"ΔT=Q/(mc)", "dT=Q/(mc)"}
+            or compact.startswith("m=Q/")
+            or compact.startswith("L=Q/")
+            or "=Q/(mc" in compact
+            or "=Q/(c" in compact
+        ):
+            return True
+
+    # De Broglie wavelength requires λ=h/(mv). Some broad atomic templates
+    # interpret m as an electron-volt energy and return a nm-scaled photon-like
+    # wavelength instead.
+    if spec.name == "atomic_nuclear" and "de broglie" in q:
+        if "h/(m_ev" in formula or "m_ev" in formula:
+            return True
+
     # Modern physics should own Rydberg/Bohr/mass-defect-per-nucleon/targeted
     # daughter-atomic-number prompts.  The broad atomic bank still handles
     # ordinary nuclear-decay templates as fallback.
