@@ -75,7 +75,7 @@ def primary_client() -> LLMClient:
 def get_physics() -> PhysicsAdapter:
     global _physics
     if _physics is None:
-        _physics = PhysicsAdapter(primary_client())
+        _physics = PhysicsAdapter(primary_client(), get_judges())
         if _physics.import_error:
             log.warning("physics pipeline import failed: %s", _physics.import_error)
         else:

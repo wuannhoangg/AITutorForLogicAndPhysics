@@ -306,7 +306,16 @@ def _stub_completion(system: str, user: str) -> str:
                 '"explanation": "Arbiter re-derives the answer from premises 1 and 2."}' % ans)
     if "senior arbiter" in s:                                  # arbiter (free-form)
         return '{"chosen": 1, "answer": "2", "premises_used": [1, 2], "explanation": "Arbiter stub."}'
-    if "physics problem solver" in s:                          # physics LLM fallback
+    if "senior physics verifier" in s:                         # physics adjudicator
+        return ('{"winner": "solver", "final_answer": "2", "final_unit": "A", '
+                '"confidence": 0.9, "solver_error": false, "llm_error": false, '
+                '"error_analysis": "Solver and LLM are consistent in the stub.", '
+                '"explanation": "Verified by comparing both physics solutions.", '
+                '"steps": ["Stub physics adjudication."]}')
+    if "expert physics solver" in s:                            # physics independent solve
+        return ('{"answer": "2", "unit": "A", "formula": "I=V/R", '
+                '"confidence": 0.8, "steps": ["Stub independent physics solve."]}')
+    if "physics problem solver" in s:                            # physics LLM fallback
         return '{"answer": "5", "unit": "A", "steps": ["Stub physics fallback."]}'
     if "a number or short text" in s or "final answer as a number or short text" in s:
         return '{"answer": "2", "premises_used": [1, 2], "explanation": "Stub free-form answer from premises 1 and 2."}'
