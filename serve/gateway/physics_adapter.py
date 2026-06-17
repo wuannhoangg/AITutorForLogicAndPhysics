@@ -9,18 +9,21 @@ Flow used for competition serving:
      quantity extraction, arithmetic, and unit handling before returning the final
      answer.
 
-The deterministic solver is still the anchor. A confident solver answer is not
-blindly overwritten: the adjudicator must return parseable JSON and identify a
-specific solver-side issue before a conflicting LLM/corrected answer may replace
-it. This gives the Type-2 path the same generate -> judge spirit as Type 1 while
-preserving the high-precision templates that already work well.
+The deterministic solver is treated as a candidate reference, not as ground
+truth. Its internal confidence is deliberately hidden from the LLM adjudicator to
+avoid anchoring small models. Python-side safety gates remain conservative: a
+conflicting LLM/corrected answer must be parseable, unit-valid, and backed by an
+explicit solver-side error diagnosis before it may replace the solver result.
 
 Useful switches:
   PHYSICS_LLM_ADJUDICATION=0       disable the new solve+judge layer
   PHYSICS_ADJUDICATE_ALWAYS=0      adjudicate only when solver/LLM disagree or
                                    the solver is weak/uncertain
-  PHYSICS_SOLVER_STRONG_CONF=0.92  confidence above which solver needs strong
+  PHYSICS_SOLVER_STRONG_CONF=0.995 confidence above which solver needs very strong
                                    evidence before override
+  PHYSICS_MEDIUM_SOLVER_CONF=0.80  confidence above which LLM override must be
+                                   explicit and self-consistent
+  PHYSICS_ADJUDICATOR_MIN_CONF=0.72 minimum adjudicator confidence for override
   PHYSICS_LLM_FALLBACK=0           disable the old uncertain-only fallback
 """
 
@@ -189,7 +192,6 @@ def _format_candidate(c: PhysicsCandidate) -> str:
         f"Source: {c.source}\n"
         f"Answer: {c.answer or 'Uncertain'}\n"
         f"Unit: {c.unit or '(empty)'}\n"
-        f"Confidence: {c.confidence:.3f}\n"
         f"Explanation: {c.explanation or '(none)'}\n"
         f"Steps: " + (" | ".join(steps) if steps else "(none)") + "\n"
         f"Diagnostics: " + ("; ".join(debug_bits) if debug_bits else "(none)")
@@ -221,7 +223,9 @@ class PhysicsAdapter:
         self.fallback_enabled = _env_bool("PHYSICS_LLM_FALLBACK", True) and client.mode == "vllm"
         self.adjudication_enabled = _env_bool("PHYSICS_LLM_ADJUDICATION", True) and client.mode == "vllm"
         self.adjudicate_always = _env_bool("PHYSICS_ADJUDICATE_ALWAYS", True)
-        self.strong_solver_conf = _env_float("PHYSICS_SOLVER_STRONG_CONF", 0.92)
+        self.strong_solver_conf = _env_float("PHYSICS_SOLVER_STRONG_CONF", 0.995)
+        self.medium_solver_conf = _env_float("PHYSICS_MEDIUM_SOLVER_CONF", 0.80)
+        self.adjudicator_min_conf = _env_float("PHYSICS_ADJUDICATOR_MIN_CONF", 0.72)
         self.pipeline = None
         self.import_error: Optional[str] = None
         try:
@@ -351,11 +355,14 @@ class PhysicsAdapter:
     ) -> Tuple[Optional[PhysicsCandidate], str]:
         arbiter = self._judge_client() or self.client
         system = (
-            "You are a senior physics verifier. You receive a problem, a deterministic "
-            "formula-solver answer, and an independent LLM answer. Verify quantity extraction, "
-            "unit conversions, formula choice, and arithmetic. The deterministic solver is a "
-            "strong reference: keep it unless you can identify a concrete formula, extraction, "
-            "arithmetic, or unit error. If both are wrong, compute the corrected answer. "
+            "You are a senior physics verifier. You receive a physics problem and two candidate "
+            "solutions. One candidate may come from a deterministic formula/template engine and "
+            "the other from an independent LLM, but neither candidate is automatically trusted. "
+            "First recompute the problem yourself from the original statement. Then compare both "
+            "candidates against your recomputation. Check quantity extraction, unit conversions, "
+            "formula choice, arithmetic, and requested output unit. Do not treat any candidate's "
+            "internal confidence, source, or style as evidence. Choose the candidate that matches "
+            "the verified derivation, or produce a corrected answer if both are wrong. "
             "Think carefully first, then end with ONE JSON object only: "
             "{\"winner\": \"solver\"|\"llm\"|\"corrected\", "
             "\"final_answer\": <numeric value only, no unit>, \"final_unit\": <ASCII unit>, "
@@ -365,11 +372,12 @@ class PhysicsAdapter:
         )
         user = (
             f"Problem:\n{question}\n\n"
-            "Candidate A — deterministic formula solver:\n"
+            "Candidate A:\n"
             f"{_format_candidate(solver)}\n\n"
-            "Candidate B — independent LLM solution:\n"
+            "Candidate B:\n"
             f"{_format_candidate(llm_candidate)}\n\n"
-            "Choose the final answer. Do not copy a candidate unless it passes your verification."
+            "Recompute from the original problem first. Do not trust either candidate by default. "
+            "Choose the final answer only if it passes your verification."
         )
 
         if arbiter is not self.client:
@@ -443,25 +451,36 @@ class PhysicsAdapter:
                 raw=data,
             )
 
-        # For a strong deterministic answer, require explicit solver_error plus a
-        # reasonably confident verdict. This is the main anti-regression gate.
-        if solver.confidence >= self.strong_solver_conf:
-            if not solver_error or conf < 0.68:
-                return solver
-            # Prefer overrides that agree with the LLM's independent value, or are
-            # explicitly marked corrected with derivation steps.
-            agrees_llm = _numbers_close(final_num, llm_candidate.number) and (
-                _units_compatible(final_unit, llm_candidate.unit) or not final_unit or not llm_candidate.unit
-            )
-            if not agrees_llm and verdict != "corrected":
-                return solver
-
-        # Medium-confidence deterministic result: still require the final answer to
-        # be numerically parseable and backed by either an LLM agreement or a solver
-        # error diagnosis.
         if final_num is None:
             return solver if not solver.is_uncertain else None
-        if not solver_error and not _numbers_close(final_num, llm_candidate.number):
+
+        agrees_llm = _numbers_close(final_num, llm_candidate.number) and (
+            _units_compatible(final_unit, llm_candidate.unit) or not final_unit or not llm_candidate.unit
+        )
+        has_derivation = len(steps) >= 2 or len(explanation) >= 24
+        valid_override_verdict = verdict in {"llm", "corrected"}
+
+        # Conservative anti-hallucination gate. For any reasonably confident solver,
+        # the adjudicator must explicitly diagnose a solver error, be confident, and
+        # either agree with the independent solution or provide corrected derivation
+        # evidence. This prevents a 4B judge from casually changing correct solver
+        # answers while still allowing rescue of high-confidence solver mistakes.
+        if solver.confidence >= self.medium_solver_conf:
+            if not (solver_error and valid_override_verdict and conf >= self.adjudicator_min_conf and has_derivation):
+                return solver
+            if not agrees_llm and not (verdict == "corrected" and len(steps) >= 2):
+                return solver
+
+        # For a near-certain deterministic answer, demand even stronger evidence.
+        if solver.confidence >= self.strong_solver_conf:
+            if conf < max(0.80, self.adjudicator_min_conf):
+                return solver
+            if not solver_error:
+                return solver
+
+        # Low-confidence deterministic result: still require the final answer to be
+        # backed by either an LLM agreement or a solver error diagnosis.
+        if not solver_error and not agrees_llm:
             return solver if not solver.is_uncertain else None
 
         return PhysicsCandidate(
